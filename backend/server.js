@@ -37,13 +37,11 @@ const onlineUsers = new Map();
 const userSockets = new Map();
 
 io.on('connection', (socket) => {
-  // Frontend'den gelen KULLANICI ADI (agent yok!)
   const userId = socket.handshake.auth.userId;
   const username = socket.handshake.auth.username;
-  const userRole = socket.handshake.auth.role || 'Üye';
+  const userRole = socket.handshake.auth.role || 'PERSONEL';
   
   if (!userId || !username) {
-    console.log('❌ Kullanıcı bilgisi eksik');
     socket.disconnect();
     return;
   }
