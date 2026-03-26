@@ -3,142 +3,238 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { createClient } from '@supabase/supabase-js';
 
 dotenv.config();
 
 const app = express();
 const httpServer = createServer(app);
-const io = new Server(httpServer, {
-  cors: {
-    origin: process.env.FRONTEND_URL || '*',
-    methods: ['GET', 'POST']
-  }
-});
 
-app.use(cors());
+// CORS ayarları
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  'https://ssemm-chat.netlify.app',
+  'http://localhost:3000',
+  'http://localhost:5173'
+].filter(Boolean);
+
+app.use(cors({
+  origin: function(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.log('Blocked origin:', origin);
+      callback(null, true); // development için geçici olarak herkese aç
+    }
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  credentials: true
+}));
+
 app.use(express.json());
 
-// Supabase client
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-);
-
-// Anahtar kodu kontrolü
-const SITE_KEY = 'SSEMMPRIVATE';
-
-app.post('/api/verify-key', (req, res) => {
-  const { key } = req.body;
-  if (key === SITE_KEY) {
-    res.json({ valid: true });
-  } else {
-    res.json({ valid: false });
-  }
+// Socket.io CORS ayarları
+const io = new Server(httpServer, {
+  cors: {
+    origin: function(origin, callback) {
+      if (!origin) return callback(null, true);
+      callback(null, true); // geçici olarak herkese açık
+    },
+    methods: ['GET', 'POST']
+  },
+  transports: ['websocket', 'polling']
 });
 
-// Socket.io bağlantıları
+// ========== PING ENDPOINT ==========
+app.get('/api/ping', (req, res) => {
+  res.json({ 
+    status: 'alive', 
+    time: new Date().toISOString(),
+    message: 'SSEMM Backend Çalışıyor'
+  });
+});
+
+// ========== ANA SAYFA ==========
+app.get('/', (req, res) => {
+  res.json({
+    name: 'SSEMM Backend API',
+    version: '1.0.0',
+    status: 'running',
+    endpoints: {
+      ping: '/api/ping',
+      health: '/api/health'
+    }
+  });
+});
+
+// ========== HEALTH CHECK ==========
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    uptime: process.uptime(),
+    timestamp: Date.now()
+  });
+});
+
+// ========== SOCKET.IO OLAYLARI ==========
 const onlineUsers = new Map(); // socketId -> userId
 const userSockets = new Map(); // userId -> socketId
+const typingUsers = new Map(); // roomId -> Set of typing users
 
 io.use(async (socket, next) => {
-  const token = socket.handshake.auth.token;
-  if (!token) return next(new Error('Authentication required'));
-  
-  try {
-    const { data: { user }, error } = await supabase.auth.getUser(token);
-    if (error || !user) return next(new Error('Invalid token'));
-    socket.user = user;
-    next();
-  } catch (err) {
-    next(new Error('Authentication failed'));
-  }
+  // Geçici auth - herkes bağlanabilir (test için)
+  socket.userId = socket.handshake.auth.userId || `user_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+  socket.username = socket.handshake.auth.username || `agent_${socket.userId.slice(-4)}`;
+  next();
 });
 
 io.on('connection', (socket) => {
-  console.log('User connected:', socket.user.id);
+  console.log('✅ Bağlantı kuruldu:', socket.id, 'Kullanıcı:', socket.username);
   
   // Kullanıcıyı online listesine ekle
-  onlineUsers.set(socket.id, socket.user.id);
-  userSockets.set(socket.user.id, socket.id);
+  onlineUsers.set(socket.id, {
+    id: socket.userId,
+    username: socket.username
+  });
+  userSockets.set(socket.userId, socket.id);
   
   // Online kullanıcıları herkese bildir
-  io.emit('users:online', Array.from(onlineUsers.values()));
+  const usersList = Array.from(onlineUsers.values());
+  io.emit('users:online', usersList);
   
-  // Mesaj gönderme
-  socket.on('message:send', async (data) => {
+  // ========== MESAJ GÖNDERME ==========
+  socket.on('message:send', (data) => {
     const { roomId, content } = data;
+    const message = {
+      id: Date.now().toString(),
+      sender_id: socket.userId,
+      sender_username: socket.username,
+      content: content,
+      room_id: roomId || 'global',
+      created_at: new Date().toISOString()
+    };
     
-    // Mesajı Supabase'e kaydet
-    const { data: message, error } = await supabase
-      .from('messages')
-      .insert({
-        room_id: roomId || 'global',
-        sender_id: socket.user.id,
-        sender_username: socket.user.user_metadata?.username || socket.user.email,
-        content: content
-      })
-      .select()
-      .single();
+    console.log(`📨 Mesaj: ${socket.username} -> ${roomId || 'global'}: ${content.substring(0, 50)}`);
     
-    if (!error && message) {
-      // Mesajı odaya yayınla
-      if (roomId) {
-        io.to(roomId).emit('message:new', message);
-      } else {
-        io.emit('message:new', message);
-      }
+    if (roomId && roomId !== 'global') {
+      // Özel odaya gönder
+      io.to(roomId).emit('message:new', message);
+    } else {
+      // Genel sohbete gönder
+      io.emit('message:new', message);
     }
   });
   
-  // Odaya katılma
+  // ========== ÖZEL MESAJ ==========
+  socket.on('private:message', (data) => {
+    const { to, content } = data;
+    const targetSocket = userSockets.get(to);
+    const message = {
+      id: Date.now().toString(),
+      sender_id: socket.userId,
+      sender_username: socket.username,
+      content: content,
+      created_at: new Date().toISOString()
+    };
+    
+    if (targetSocket) {
+      io.to(targetSocket).emit('private:message', message);
+      socket.emit('private:message', message); // gönderene de göster
+    } else {
+      socket.emit('private:error', { to, error: 'Kullanıcı çevrimdışı' });
+    }
+  });
+  
+  // ========== ODAYA KATIL ==========
   socket.on('room:join', (roomId) => {
     socket.join(roomId);
     socket.to(roomId).emit('room:user-joined', {
-      userId: socket.user.id,
-      username: socket.user.user_metadata?.username
+      userId: socket.userId,
+      username: socket.username
     });
   });
   
-  // Odadan ayrılma
+  // ========== ODAYI TERK ET ==========
   socket.on('room:leave', (roomId) => {
     socket.leave(roomId);
     socket.to(roomId).emit('room:user-left', {
-      userId: socket.user.id,
-      username: socket.user.user_metadata?.username
+      userId: socket.userId,
+      username: socket.username
     });
   });
   
-  // Yazıyor bildirimi
-  socket.on('typing:start', (roomId) => {
-    socket.to(roomId).emit('typing:start', {
-      userId: socket.user.id,
-      username: socket.user.user_metadata?.username
-    });
+  // ========== YAZIYOR BİLDİRİMİ ==========
+  socket.on('typing:start', (data) => {
+    const { to, roomId } = data;
+    if (to) {
+      // Özel mesaj için yazıyor bildirimi
+      const targetSocket = userSockets.get(to);
+      if (targetSocket) {
+        io.to(targetSocket).emit('typing:start', {
+          userId: socket.userId,
+          username: socket.username
+        });
+      }
+    } else if (roomId) {
+      // Oda için yazıyor bildirimi
+      socket.to(roomId).emit('typing:start', {
+        userId: socket.userId,
+        username: socket.username
+      });
+    }
   });
   
-  socket.on('typing:stop', (roomId) => {
-    socket.to(roomId).emit('typing:stop', {
-      userId: socket.user.id
-    });
+  socket.on('typing:stop', (data) => {
+    const { to, roomId } = data;
+    if (to) {
+      const targetSocket = userSockets.get(to);
+      if (targetSocket) {
+        io.to(targetSocket).emit('typing:stop', {
+          userId: socket.userId
+        });
+      }
+    } else if (roomId) {
+      socket.to(roomId).emit('typing:stop', {
+        userId: socket.userId
+      });
+    }
   });
   
-  // Bağlantı kesilme
+  // ========== PING/PONG ==========
+  socket.on('ping', (callback) => {
+    if (typeof callback === 'function') {
+      callback();
+    }
+  });
+  
+  // ========== BAĞLANTI KESİLME ==========
   socket.on('disconnect', () => {
-    const userId = onlineUsers.get(socket.id);
+    const user = onlineUsers.get(socket.id);
+    console.log('❌ Bağlantı kesildi:', socket.id, user?.username);
     onlineUsers.delete(socket.id);
-    userSockets.delete(userId);
+    if (user) {
+      userSockets.delete(user.id);
+    }
     io.emit('users:online', Array.from(onlineUsers.values()));
-    console.log('User disconnected:', userId);
   });
 });
 
-// Ping endpoint (Render'ı uyanık tutmak için)
-app.get('/api/ping', (req, res) => {
-  res.json({ status: 'alive', time: new Date() });
+// ========== SUNUCU BAŞLAT ==========
+const PORT = process.env.PORT || 3001;
+httpServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`
+  🚀 SSEMM Backend Sunucusu Başladı!
+  📡 Port: ${PORT}
+  🌐 URL: http://0.0.0.0:${PORT}
+  🏓 Ping: http://0.0.0.0:${PORT}/api/ping
+  `);
 });
 
-const PORT = process.env.PORT || 3001;
-httpServer.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+// ========== HATA YAKALAMA ==========
+process.on('uncaughtException', (err) => {
+  console.error('❌ Yakalanmamış hata:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Yakalanmamış promise rejection:', reason);
 });
